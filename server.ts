@@ -15,15 +15,25 @@ async function startServer() {
   // --- AGENTIC AI LOGIC ---
 
   interface TimetableSlot {
+    section: string;
     day: string;
     period: number;
     subject: string;
     teacher: string;
+    isConflict?: boolean;
+    conflictMessage?: string;
   }
 
   interface GenerateRequest {
+    sections: string[]; // e.g. ["CSE-A", "CSE-B"]
     subjects: string[];
     teachers: Record<string, string>; // subject -> teacher
+    labs?: string[]; // subjects that are labs (double periods)
+    absentTeachers?: string[];
+    constraints: {
+      maxClassesPerDay: number;
+      avoidConsecutive: boolean;
+    };
     days?: string[];
     periodsPerDay?: number;
   }
@@ -31,57 +41,94 @@ async function startServer() {
   const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
   const PERIODS = 6;
 
-  // Step 1: Generator - Randomly assigns subjects
+  // Step 1: Generator - Handles multiple sections and avoids absent teachers
   function generateInitial(req: GenerateRequest): TimetableSlot[] {
     const timetable: TimetableSlot[] = [];
-    const { subjects, teachers } = req;
+    const { sections, subjects, teachers, labs = [], absentTeachers = [] } = req;
     const days = req.days || DAYS;
     const periods = req.periodsPerDay || PERIODS;
 
-    for (const day of days) {
-      for (let p = 1; p <= periods; p++) {
-        const randomSubject = subjects[Math.floor(Math.random() * subjects.length)];
-        timetable.push({
-          day,
-          period: p,
-          subject: randomSubject,
-          teacher: teachers[randomSubject] || "Unassigned",
-        });
+    for (const section of sections) {
+      for (const day of days) {
+        const daySlots: (TimetableSlot | null)[] = new Array(periods).fill(null);
+        
+        // Place Labs (Double Periods)
+        const availableLabs = labs.filter(l => subjects.includes(l));
+        if (availableLabs.length > 0 && Math.random() > 0.3) {
+          const labSubject = availableLabs[Math.floor(Math.random() * availableLabs.length)];
+          const startIdx = Math.floor(Math.random() * (periods - 1));
+          
+          const teacher = teachers[labSubject] || "Unassigned";
+          const finalTeacher = absentTeachers.includes(teacher) ? "Substitution" : teacher;
+
+          daySlots[startIdx] = {
+            section, day, period: startIdx + 1,
+            subject: `${labSubject} (Lab)`,
+            teacher: finalTeacher,
+          };
+          daySlots[startIdx + 1] = {
+            section, day, period: startIdx + 2,
+            subject: `${labSubject} (Lab)`,
+            teacher: finalTeacher,
+          };
+        }
+
+        // Fill remaining slots
+        for (let i = 0; i < periods; i++) {
+          if (!daySlots[i]) {
+            const nonLabSubjects = subjects.filter(s => !labs.includes(s) || Math.random() > 0.5);
+            const randomSubject = nonLabSubjects[Math.floor(Math.random() * nonLabSubjects.length)] || subjects[0];
+            const teacher = teachers[randomSubject] || "Unassigned";
+            const finalTeacher = absentTeachers.includes(teacher) ? "Substitution" : teacher;
+
+            daySlots[i] = {
+              section, day, period: i + 1,
+              subject: randomSubject,
+              teacher: finalTeacher,
+            };
+          }
+        }
+        
+        daySlots.forEach(slot => { if (slot) timetable.push(slot); });
       }
     }
     return timetable;
   }
 
-  // Step 2: Checker - Identifies conflicts
-  function checkConstraints(timetable: TimetableSlot[]) {
-    const conflicts: string[] = [];
-    const teacherSchedule: Record<string, Set<string>> = {}; // teacher -> Set("Day-Period")
+  // Step 2: Checker - Identifies conflicts (Teacher Overlap, Constraints)
+  function checkConstraints(timetable: TimetableSlot[], req: GenerateRequest) {
+    const conflicts: { slotIndex: number; message: string }[] = [];
+    const teacherUsage: Record<string, number[]> = {}; // "Teacher-Day-Period" -> [slotIndices]
 
-    // Check for teacher overlap (though in a single class timetable this is less likely unless multiple classes)
-    // For this prototype, let's focus on "Balanced Distribution" and "No back-to-back same subject" as constraints
-    
-    const subjectCounts: Record<string, number> = {};
-    timetable.forEach(slot => {
-      subjectCounts[slot.subject] = (subjectCounts[slot.subject] || 0) + 1;
+    timetable.forEach((slot, index) => {
+      if (slot.teacher !== "Substitution" && slot.teacher !== "Unassigned") {
+        const key = `${slot.teacher}-${slot.day}-${slot.period}`;
+        if (!teacherUsage[key]) teacherUsage[key] = [];
+        teacherUsage[key].push(index);
+      }
     });
 
-    // Constraint: Balanced distribution (no subject should have > 25% more than average)
-    const avg = timetable.length / Object.keys(subjectCounts).length;
-    for (const sub in subjectCounts) {
-      if (subjectCounts[sub] > avg * 1.5) {
-        conflicts.push(`Subject ${sub} is over-represented (${subjectCounts[sub]} slots).`);
+    // 1. Conflict: Teacher Overlap across sections
+    for (const key in teacherUsage) {
+      if (teacherUsage[key].length > 1) {
+        const teacherName = key.split("-")[0];
+        teacherUsage[key].forEach(idx => {
+          conflicts.push({ 
+            slotIndex: idx, 
+            message: `Conflict: ${teacherName} is assigned to multiple sections in this slot.` 
+          });
+        });
       }
     }
 
-    // Constraint: No more than 2 consecutive same subjects
-    for (let i = 0; i < timetable.length - 2; i++) {
-      if (
-        timetable[i].day === timetable[i+1].day && 
-        timetable[i+1].day === timetable[i+2].day &&
-        timetable[i].subject === timetable[i+1].subject && 
-        timetable[i+1].subject === timetable[i+2].subject
-      ) {
-        conflicts.push(`Triple consecutive ${timetable[i].subject} on ${timetable[i].day}.`);
+    // 2. Constraint: Avoid consecutive same subjects
+    if (req.constraints.avoidConsecutive) {
+      for (let i = 0; i < timetable.length - 1; i++) {
+        const s1 = timetable[i];
+        const s2 = timetable[i+1];
+        if (s1.section === s2.section && s1.day === s2.day && s1.subject === s2.subject && !s1.subject.includes("(Lab)")) {
+          conflicts.push({ slotIndex: i+1, message: `Constraint: Consecutive ${s1.subject} sessions.` });
+        }
       }
     }
 
@@ -92,24 +139,31 @@ async function startServer() {
   function agenticRefine(req: GenerateRequest) {
     let timetable = generateInitial(req);
     let attempts = 0;
-    const maxAttempts = 10;
-    let logs: string[] = ["Initial timetable generated."];
+    const maxAttempts = 15;
+    let logs: string[] = ["Agent started optimization loop..."];
 
     while (attempts < maxAttempts) {
-      const conflicts = checkConstraints(timetable);
+      const conflicts = checkConstraints(timetable, req);
+      
+      // Clear previous conflict markers
+      timetable.forEach(s => { delete s.isConflict; delete s.conflictMessage; });
+
       if (conflicts.length === 0) {
-        logs.push("No conflicts found. Valid timetable produced.");
+        logs.push("Success: All constraints satisfied.");
         break;
       }
 
-      logs.push(`Attempt ${attempts + 1}: Found ${conflicts.length} conflicts. Fixing...`);
-      // Simple "fix": Regenerate a portion or swap
+      // Mark conflicts for the final return if we fail
+      conflicts.forEach(c => {
+        timetable[c.slotIndex].isConflict = true;
+        timetable[c.slotIndex].conflictMessage = c.message;
+      });
+
+      logs.push(`Attempt ${attempts + 1}: Found ${conflicts.length} issues. Re-optimizing...`);
+      
+      // Strategy: Regenerate and try again
       timetable = generateInitial(req); 
       attempts++;
-    }
-
-    if (attempts === maxAttempts) {
-      logs.push("Reached max attempts. Returning best effort.");
     }
 
     return { timetable, logs, attempts };
