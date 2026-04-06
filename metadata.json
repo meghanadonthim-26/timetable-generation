@@ -1,0 +1,5 @@
+{
+  "name": "Smart Agentic AI Timetable Generator",
+  "description": "A full-stack application that uses an agentic AI loop (generate-check-fix) to create conflict-free academic timetables.",
+  "requestFramePermissions": []
+}
